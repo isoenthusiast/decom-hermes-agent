@@ -441,6 +441,16 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
     with kbc.connect() as conn:
         # Review-lane task with a fresh PR comment.
         review_id = kb.create_task(conn, title="review me", assignee="reviewer")
+        # Valid audit comments can intentionally omit a paired `commented`
+        # event; they must not break ordering for later normal comments.
+        with kb.write_txn(conn):
+            kb._insert_comment(
+                conn,
+                review_id,
+                author="system",
+                body="Audit note",
+                created_at=int(__import__("time").time()),
+            )
         claimed = kb.claim_task(conn, review_id)
         assert claimed is not None
         kb.add_comment(conn, review_id, author="worker", body=pr_comment)
@@ -455,12 +465,34 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert kbd.check_respawn_guard(conn, ready_id) == "active_pr"
         assert kbd.check_respawn_guard(conn, review_id, lane="review") is None
 
+        # An explicit review rejection after the PR comment is a deliberate
+        # continuation of the same card/PR, not a duplicate implementation.
+        review_claim = kb.claim_review_task(conn, review_id)
+        assert review_claim is not None
+        assert kb.request_changes(
+            conn,
+            review_id,
+            reason="Address the review findings on the existing PR.",
+            expected_run_id=review_claim.current_run_id,
+        ) == (True, "reviewer")
+        assert kbd.check_respawn_guard(conn, review_id) is None
+
         res = kbd.dispatch_once(conn, dry_run=True)
         spawned_ids = [s[0] for s in res.spawned]
         guarded = dict(res.respawn_guarded)
         assert review_id in spawned_ids
         assert ready_id not in spawned_ids
         assert guarded.get(ready_id) == "active_pr"
+
+        # A newer PR comment supersedes that authorization; an older review
+        # rejection must not become a permanent bypass for future ambiguity.
+        kb.add_comment(
+            conn,
+            review_id,
+            author="worker",
+            body="Updated https://github.com/example/repo/pull/123 again.",
+        )
+        assert kbd.check_respawn_guard(conn, review_id) == "active_pr"
 
         # Rate-limit cooldown still defers the review lane.
         _now = int(__import__("time").time())
