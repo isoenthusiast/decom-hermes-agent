@@ -1502,9 +1502,10 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR). The review
-    lane skips the last two: they are the *inputs* to a review handoff. Stale /
-    dead claim locks are NOT a guard reason — the reclaim passes own those.
+    (PR URL in a recent comment, unless a later lifecycle event explicitly returns
+    the card for another implementation pass). The review lane skips the last two:
+    they are the *inputs* to a review handoff. Stale / dead claim locks are NOT a
+    guard reason — the reclaim passes own those.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1571,12 +1572,51 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    An explicit lifecycle event after the newest PR comment can deliberately
+    #    return that same card/PR for another implementation pass.  Do not make
+    #    the existence of the long-lived PR a permanent respawn prohibition.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+    pr_comments = conn.execute(
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? AND body IS NOT NULL",
         (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+    ).fetchall()
+    pr_comment = max(
+        (c for c in pr_comments if _RESPAWN_GUARD_PR_URL_RE.search(c["body"])),
+        key=lambda c: int(c["id"]),
+        default=None,
+    )
+    if pr_comment is not None:
+        # New comments carry their row id in the paired event, giving total
+        # ordering across the comment/event tables even inside one second.
+        comment_event = None
+        for event in conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'commented' AND created_at >= ? "
+            "ORDER BY id DESC",
+            (task_id, pr_cutoff),
+        ).fetchall():
+            payload = _kb._json_dict(event["payload"])
+            if payload.get("comment_id") == int(pr_comment["id"]):
+                comment_event = event
+                break
+        if comment_event is not None:
+            deliberate_rework = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND id > ? "
+                "AND kind IN ('changes_requested', 'review_reopened') LIMIT 1",
+                (task_id, int(comment_event["id"])),
+            ).fetchone()
+        else:
+            # Legacy/imported comments may lack a paired event. Fail safe on
+            # same-second ambiguity: only a strictly later review event bypasses.
+            deliberate_rework = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND created_at > ? "
+                "AND kind IN ('changes_requested', 'review_reopened') LIMIT 1",
+                (task_id, int(pr_comment["created_at"])),
+            ).fetchone()
+        if not deliberate_rework:
             return "active_pr"
 
     return None

@@ -1716,8 +1716,14 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {"comment_id": comment_id, "author": author, "len": len(body)},
+        )
+        return comment_id
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
