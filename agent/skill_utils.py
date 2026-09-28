@@ -25,6 +25,21 @@ EXCLUDED_SKILL_DIRS = frozenset((
 # via skill_view(skill, file_path=...), never scanned as standalone skills.
 SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 
+# Bookkeeping that can appear *inside* a skill root: a card worktree of the skills
+# library itself (``<root>/.worktrees/<task>/``) re-publishes every skill, which
+# makes a force-loaded ``--skills`` request ambiguous ("2 candidates" -> the worker
+# exits at boot with "Unknown skill(s)") and silently serves the worktree's copy
+# to first-wins name resolution. Dot-directories are never skill categories.
+def is_bookkeeping_skill_dir(name: str) -> bool:
+    """True for a dot-directory *name* yielded by a walk inside a skill root.
+
+    DIRECTORIES ONLY, and only the child names an ``os.walk`` yields: a skill root
+    may itself live under a dotted path (``~/.orrery/library``), so this must never
+    be applied to the components of a full path.
+    """
+    return name.startswith(".")
+
+
 # Org mirrors live under skills/_org/<org_id>/ and are TOKEN-GATED: the sync
 # client writes the marker after verifying the token; no marker => no org skills
 # load. The marker persists offline so already-pulled org skills keep working.
@@ -748,7 +763,10 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
             dirs.remove(ORG_MIRROR_DIR_NAME)
         elif root == org_root:
             dirs[:] = [d for d in dirs if d == active_org]
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
+        dirs[:] = [d for d in dirs
+                   if not is_bookkeeping_skill_dir(d)
+                   and d not in EXCLUDED_SKILL_DIRS
+                   and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
         if filename in files:
             matches.append(os.path.join(root, filename))
     yield from map(Path, sorted(matches))

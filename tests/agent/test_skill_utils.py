@@ -198,6 +198,45 @@ def test_iter_skill_index_files_keeps_support_named_categories(tmp_path):
     assert is_excluded_skill_path(scripts_skill / "SKILL.md") is False
 
 
+def test_iter_skill_index_files_skips_dot_directories(tmp_path):
+    """Bookkeeping inside a skill root is never a second copy of a skill.
+
+    A card worktree of the skills library itself (``<root>/.worktrees/<task>/``)
+    re-publishes every skill; discovering it makes a force-loaded ``--skills``
+    request ambiguous, and the worker exits at boot with "Unknown skill(s)".
+    """
+    real = tmp_path / "devops" / "kanban-git-verified-completion"
+    real.mkdir(parents=True)
+    (real / "SKILL.md").write_text(
+        "---\nname: kanban-git-verified-completion\n---\n", encoding="utf-8")
+
+    copy = tmp_path / ".worktrees" / "t_deadbeef" / "devops" / "kanban-git-verified-completion"
+    copy.mkdir(parents=True)
+    (copy / "SKILL.md").write_text(
+        "---\nname: kanban-git-verified-completion\n---\n", encoding="utf-8")
+
+    found = list(iter_skill_index_files(tmp_path, "SKILL.md"))
+
+    assert found == [real / "SKILL.md"]
+
+
+def test_iter_skill_index_files_scans_a_skills_root_under_a_dotted_path(tmp_path):
+    """The dot rule is a child *name* rule, not a path rule.
+
+    Skill roots legitimately live under dotted paths (``~/.orrery/library``,
+    ``~/.hermes/skills``); pruning on path components would hide every skill there.
+    """
+    root = tmp_path / ".orrery" / "library"
+    skill = root / "devops" / "kanban-git-verified-completion"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: kanban-git-verified-completion\n---\n", encoding="utf-8")
+
+    found = list(iter_skill_index_files(root, "SKILL.md"))
+
+    assert found == [skill / "SKILL.md"]
+
+
 def test_skill_support_path_uses_explicit_discovery_root_not_cwd(tmp_path, monkeypatch):
     discovery_root = tmp_path / "site-packages" / "skills"
     umbrella = discovery_root / "category" / "umbrella"
