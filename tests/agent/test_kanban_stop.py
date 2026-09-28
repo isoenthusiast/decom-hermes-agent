@@ -50,6 +50,7 @@ def test_nudge_when_no_terminal_tool(clear_kanban_env):
     assert nudge is not None
     assert "kanban_complete" in nudge
     assert "kanban_block" in nudge
+    assert "kanban_request_review" in nudge
     assert "t_46be8aa5" in nudge
     assert "protocol violation" in nudge.lower() or "protocol" in nudge.lower()
 
@@ -69,6 +70,37 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
             ],
         },
         {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": "done"},
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_no_nudge_after_kanban_request_review(clear_kanban_env):
+    """A review handoff IS a terminal board action for its run.
+
+    Regression: counting only complete/block made every plan handoff a false positive — the guard
+    nudged a worker that had already handed the card to review, and the next run burned its budget
+    proving it was not still running.
+    """
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "kanban_request_review", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "tool_call_id": "1",
+            "content": "card moved to review",
+        },
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
