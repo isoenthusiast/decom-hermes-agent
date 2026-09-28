@@ -110,6 +110,36 @@ def test_no_nudge_after_kanban_request_review(clear_kanban_env):
 
 
 
+def test_no_nudge_after_kanban_request_changes(clear_kanban_env):
+    """The reviewer's verdict is terminal for the review run, like a handoff.
+
+    Regression, other side of the same defect: a review-lane run that had already returned rework
+    was nudged to prove the card was not still running — the ceremony was paid twice per card.
+    """
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "kanban_request_changes", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_changes",
+            "tool_call_id": "1",
+            "content": "rework requested",
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────
 # These tests verify the two layers compose correctly: the agent-side
 # nudge fires first (up to 2 attempts), and if the worker still exits
