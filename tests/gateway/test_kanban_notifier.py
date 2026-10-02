@@ -795,7 +795,16 @@ def test_review_requested_claims_card_then_wakes_one_reviewer_who_completes_with
     finally:
         conn.close()
 
-    adapter = RecordingAdapter()
+    class ToolCallingAdapter(RecordingAdapter):
+        async def handle_message(self, event):
+            from tools.kanban_tools import _handle_complete
+
+            self.handled.append(event)
+            result = _handle_complete({"task_id": tid, "summary": "approved"})
+            assert '"ok": true' in result
+            event._gateway_accepted = True
+
+    adapter = ToolCallingAdapter()
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
@@ -804,30 +813,19 @@ def test_review_requested_claims_card_then_wakes_one_reviewer_who_completes_with
     assert "ready for review" in adapter.sent[0]["text"]
     assert len(adapter.handled) == 1
 
-    # The notifier claimed the card for the interactive session before waking,
-    # so the card is no longer awaiting a reviewer.
+    # The woken reviewer completed through the real kanban tool handler inside
+    # the native wake; the claim was consumed by that tool before this readback.
     conn = kbc.connect()
     try:
         claimed = kb.get_task(conn, tid)
-        assert claimed is not None and claimed.status == "running"
-        assert claimed.current_run_id is not None
+        assert claimed is not None and claimed.status == "done"
+        assert claimed.current_run_id is None
     finally:
         conn.close()
 
-    # The woken reviewer completes WITHOUT force: as an env-scoped session it
-    # resolves its own live run as expected_run_id — exactly like the
-    # gateway-woken interactive reviewer in the #19534 flow.
-    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
-    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    # No task/run environment was injected into this session.
     conn = kbc.connect()
     try:
-        from tools.kanban_tools import _resolve_expected_run_id
-
-        expected = _resolve_expected_run_id(kb, conn, tid)
-        assert expected is not None and expected == claimed.current_run_id
-        assert kb.complete_task(
-            conn, tid, summary="approved", expected_run_id=expected,
-        )
         assert kb.get_task(conn, tid).status == "done"
     finally:
         conn.close()

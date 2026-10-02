@@ -186,7 +186,13 @@ def _resolve_expected_run_id(
     except Exception:
         claim = None
     if claim is not None:
-        if claim.task_id != task_id or (claim.board is not None and claim.board != board):
+        # ``board=None`` means the connected active board everywhere else in
+        # this tool surface. Resolve that identity before validating the
+        # trusted claim; comparing against the raw optional argument would
+        # reject a valid claim whenever the caller omitted ``board``.
+        effective_board = kb._normalize_board_slug(board) or kb.get_current_board()
+        claim_board = kb._normalize_board_slug(claim.board) if claim.board is not None else effective_board
+        if claim.task_id != task_id or claim_board != effective_board:
             return None
         return claim.run_id
 

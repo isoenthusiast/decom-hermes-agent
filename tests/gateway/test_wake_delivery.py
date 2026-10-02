@@ -102,6 +102,69 @@ def test_native_wake_carries_claim_into_tool_and_isolates_it(tmp_path, monkeypat
     assert current_kanban_run_claim() is None
 
 
+def test_native_wake_claim_matches_omitted_active_board(tmp_path, monkeypatch):
+    """Omitting ``board`` uses the same connected board as native tools."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-board.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="board identity", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer="interactive")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+    finally:
+        conn.close()
+
+    from gateway.kanban_claim import KanbanRunClaim, kanban_run_claim
+    from tools.kanban_tools import _resolve_expected_run_id
+
+    conn = kbc.connect()
+    try:
+        with kanban_run_claim(KanbanRunClaim("default", task_id, run_id)):
+            assert _resolve_expected_run_id(kb, conn, task_id) == run_id
+            assert _resolve_expected_run_id(kb, conn, task_id, "default") == run_id
+            assert _resolve_expected_run_id(kb, conn, task_id, "other-board") is None
+    finally:
+        conn.close()
+
+
+def test_simultaneous_native_wakes_keep_claims_isolated():
+    """Concurrent gateway turns cannot borrow one another's review claim."""
+    from gateway.kanban_claim import KanbanRunClaim, current_kanban_run_claim
+
+    seen = {}
+
+    class ConcurrentAdapter(PushAdapter):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        async def handle_message(self, event):
+            await asyncio.sleep(0)
+            claim = current_kanban_run_claim()
+            assert claim is not None
+            seen[self.name] = (claim.task_id, claim.run_id)
+            event._gateway_accepted = True
+
+    async def run():
+        await asyncio.gather(
+            deliver_wake(
+                ConcurrentAdapter("first"), text="first", source=_source(),
+                kanban_claim=KanbanRunClaim("default", "task-first", 101),
+            ),
+            deliver_wake(
+                ConcurrentAdapter("second"), text="second", source=_source(),
+                kanban_claim=KanbanRunClaim("default", "task-second", 202),
+            ),
+        )
+
+    asyncio.run(run())
+    assert seen == {
+        "first": ("task-first", 101),
+        "second": ("task-second", 202),
+    }
+
+
 async def _serve(handler):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web
