@@ -156,6 +156,29 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _connected_board_slug(kb: Any, board: Optional[str]) -> Optional[str]:
+    """Resolve the board identity for the DB this process is actually connected to.
+
+    ``HERMES_KANBAN_DB`` is a worker pin and can intentionally point at a temporary or
+    legacy path whose slug is not represented by the current-board symlink. In that case
+    the connected path is the authority; a named board env remains the explicit identity.
+    """
+    normalized = kb._normalize_board_slug(board)
+    if normalized:
+        return normalized
+    pinned_path = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if pinned_path:
+        named = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+        if named:
+            return kb._normalize_board_slug(named)
+        path = os.path.abspath(os.path.expanduser(pinned_path))
+        marker = os.path.normpath(path).split(os.sep)
+        if len(marker) >= 3 and marker[-3] == "boards" and marker[-1] == "kanban.db":
+            return kb._normalize_board_slug(marker[-2])
+        return kb.DEFAULT_BOARD
+    return kb.get_current_board()
+
+
 def _resolve_expected_run_id(
     kb: Any, conn: Any, task_id: str, board: Optional[str] = None,
 ) -> Optional[int]:
@@ -190,7 +213,7 @@ def _resolve_expected_run_id(
         # this tool surface. Resolve that identity before validating the
         # trusted claim; comparing against the raw optional argument would
         # reject a valid claim whenever the caller omitted ``board``.
-        effective_board = kb._normalize_board_slug(board) or kb.get_current_board()
+        effective_board = _connected_board_slug(kb, board)
         claim_board = kb._normalize_board_slug(claim.board) if claim.board is not None else effective_board
         if claim.task_id != task_id or claim_board != effective_board:
             return None

@@ -79,6 +79,9 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # Trusted native wake ownership. This is populated by ``deliver_wake`` and carried with the
+    # event through busy-session queues; it is never sourced from model-visible text or metadata.
+    _kanban_claim: Any = field(default=None, init=False, repr=False, compare=False)
 
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""

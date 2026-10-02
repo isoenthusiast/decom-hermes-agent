@@ -3395,7 +3395,7 @@ class BasePlatformAdapter(ABC):
         (False)."""
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
-        task = asyncio.create_task(self._process_message_background(event, session_key))
+        task = asyncio.create_task(self._process_message_background_with_claim(event, session_key))
         if not self._track_session_task(session_key, task):
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
@@ -3904,6 +3904,12 @@ class BasePlatformAdapter(ABC):
         elif current_task is not None and self._session_tasks.get(session_key) is current_task:
             self._cleanup_finished_session_task(session_key, interrupt_event)
 
+    async def _process_message_background_with_claim(self, event: MessageEvent, session_key: str) -> None:
+        """Run one event with its trusted native wake claim bound at consumption time."""
+        from gateway.kanban_claim import kanban_run_claim
+        with kanban_run_claim(getattr(event, "_kanban_claim", None)):
+            await self._process_message_background(event, session_key)
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
@@ -4011,7 +4017,7 @@ class BasePlatformAdapter(ABC):
         self._clear_session_guard(session_key)
         self._track_session_task(
             session_key,
-            asyncio.create_task(self._process_message_background(pending_event, session_key)))
+            asyncio.create_task(self._process_message_background_with_claim(pending_event, session_key)))
 
     def _clear_session_guard(self, session_key: str) -> None:
         """Clear (not delete) the session's interrupt Event so the guard stays live for inbound."""

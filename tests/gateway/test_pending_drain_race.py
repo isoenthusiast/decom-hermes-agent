@@ -32,6 +32,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
+from gateway.kanban_claim import KanbanRunClaim, current_kanban_run_claim
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -225,3 +226,42 @@ async def test_no_pending_cleans_up_normally():
     assert sk not in adapter._pending_messages
 
     await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_native_wake_claim_survives_busy_queue_and_binds_at_consumer():
+    """A claim admitted while busy must authorize the later queued consumer, not admission only."""
+    adapter = _make_adapter()
+    sk = _sk()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_processed = asyncio.Event()
+    seen: list[tuple[str, int] | None] = []
+
+    async def handler(event):
+        claim = current_kanban_run_claim()
+        seen.append((claim.task_id, claim.run_id) if claim is not None else None)
+        if event.text == "first":
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_processed.set()
+        return None
+
+    adapter._message_handler = handler
+    first = _make_event(text="first")
+    first._kanban_claim = KanbanRunClaim("default", "task-first", 101)
+    second = _make_event(text="second")
+    second._kanban_claim = KanbanRunClaim("default", "task-second", 202)
+
+    await adapter.handle_message(first)
+    await asyncio.wait_for(first_started.wait(), timeout=5.0)
+    await adapter.handle_message(second)
+    assert adapter._pending_messages[sk] is second
+
+    release_first.set()
+    await asyncio.wait_for(second_processed.wait(), timeout=5.0)
+    await adapter.cancel_background_tasks()
+
+    assert seen == [("task-first", 101), ("task-second", 202)]
+    assert current_kanban_run_claim() is None

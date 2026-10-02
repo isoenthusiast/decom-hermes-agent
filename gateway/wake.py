@@ -64,6 +64,7 @@ async def deliver_wake(
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
         from gateway.platforms.event import MessageEvent, MessageType
         synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True)
+        synth_event._kanban_claim = kanban_claim
         # This is process-local trusted state, not event text or model input.  The
         # context is inherited by the native turn's tool calls and reset when the
         # adapter has finished handling the event, so simultaneous conversations

@@ -165,6 +165,24 @@ def test_simultaneous_native_wakes_keep_claims_isolated():
     }
 
 
+def test_native_wake_claim_uses_pinned_db_when_current_board_disagrees(tmp_path, monkeypatch):
+    """A worker DB pin must win over an unrelated current-board symlink."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "worker.db"))
+    monkeypatch.setattr(kb, "get_current_board", lambda: "foreign")
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="pinned database", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer="interactive")
+        assert claimed is not None and claimed.current_run_id is not None
+        from gateway.kanban_claim import KanbanRunClaim, kanban_run_claim
+        from tools.kanban_tools import _resolve_expected_run_id
+        with kanban_run_claim(KanbanRunClaim("default", task_id, claimed.current_run_id)):
+            assert _resolve_expected_run_id(kb, conn, task_id) == claimed.current_run_id
+    finally:
+        conn.close()
+
+
 async def _serve(handler):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web
