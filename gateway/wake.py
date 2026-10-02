@@ -51,7 +51,10 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
         raise WakeNotAccepted("internal wake not accepted by adapter")
 
 
-async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None) -> None:
+async def deliver_wake(
+    adapter: Any, *, text: str, session_id: str = "", source: Any = None,
+    kanban_claim: Any = None,
+) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. Raises on
@@ -61,7 +64,13 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
         from gateway.platforms.event import MessageEvent, MessageType
         synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True)
-        await admit_internal_event(adapter, synth_event)
+        # This is process-local trusted state, not event text or model input.  The
+        # context is inherited by the native turn's tool calls and reset when the
+        # adapter has finished handling the event, so simultaneous conversations
+        # cannot borrow one another's review claim.
+        from gateway.kanban_claim import kanban_run_claim
+        with kanban_run_claim(kanban_claim):
+            await admit_internal_event(adapter, synth_event)
         return
     if not session_id:
         raise ValueError("deliver_wake: non-push adapter (supports_async_delivery=False) "

@@ -156,7 +156,9 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
-def _resolve_expected_run_id(kb: Any, conn: Any, task_id: str) -> Optional[int]:
+def _resolve_expected_run_id(
+    kb: Any, conn: Any, task_id: str, board: Optional[str] = None,
+) -> Optional[int]:
     """Return the run id this caller must assert to own ``task_id``.
 
     A dispatcher worker proves ownership with its own run id
@@ -174,6 +176,20 @@ def _resolve_expected_run_id(kb: Any, conn: Any, task_id: str) -> Optional[int]:
     orchestrator close — see
     ``tests/hermes_cli/test_kanban_review_lifecycle_complete.py``.
     """
+    # Native gateway wakes carry an immutable claim in a ContextVar. Unlike
+    # prompt text or process-global env, this is scoped to the actual turn and
+    # cannot be selected by the model. Foreign and cross-board claims resolve
+    # to None; stale claims retain their run id so the DB CAS rejects them.
+    try:
+        from gateway.kanban_claim import current_kanban_run_claim
+        claim = current_kanban_run_claim()
+    except Exception:
+        claim = None
+    if claim is not None:
+        if claim.task_id != task_id or (claim.board is not None and claim.board != board):
+            return None
+        return claim.run_id
+
     wid = _worker_run_id(task_id)
     if wid is not None:
         return wid
@@ -768,7 +784,7 @@ def _handle_complete(args: dict, **kw) -> str:
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_resolve_expected_run_id(kb, conn, tid))
+                created_cards=created_cards, expected_run_id=_resolve_expected_run_id(kb, conn, tid, args.get("board")))
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
@@ -823,7 +839,7 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_resolve_expected_run_id(kb, conn, tid))
+        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_resolve_expected_run_id(kb, conn, tid, args.get("board")))
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
         return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)
 
@@ -847,7 +863,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
         ok, fail_reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
-            expected_run_id=_resolve_expected_run_id(kb, conn, tid), with_reason=True)
+            expected_run_id=_resolve_expected_run_id(kb, conn, tid, args.get("board")), with_reason=True)
         _check(ok, f"could not request review for {tid}: "
                    f"{fail_reason or 'unknown id or not in running/ready'}")
         return _ok_landed(kb, conn, tid, "review")
@@ -861,7 +877,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
         _require_text(args, "reason", "reason is required — describe the changes needed"))
     with _board(args.get("board")) as (kb, conn):
         ok, detail = kb.request_changes(
-            conn, tid, reason=reason, expected_run_id=_resolve_expected_run_id(kb, conn, tid))
+            conn, tid, reason=reason, expected_run_id=_resolve_expected_run_id(kb, conn, tid, args.get("board")))
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
         return _ok_landed(kb, conn, tid, "ready", implementer=detail)
 

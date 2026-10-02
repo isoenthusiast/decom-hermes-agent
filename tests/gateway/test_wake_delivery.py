@@ -15,6 +15,8 @@ import pytest
 from gateway.config import Platform
 from gateway.session import SessionSource
 from gateway.wake import deliver_wake, adapter_supports_push
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 class PushAdapter:
@@ -51,6 +53,53 @@ def _source():
 def test_adapter_supports_push_default_true():
     assert adapter_supports_push(PushAdapter()) is True
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
+
+
+def test_native_wake_carries_claim_into_tool_and_isolates_it(tmp_path, monkeypatch):
+    """A real native wake carries its reserved run to the tool boundary.
+
+    No task/run environment is injected: the trusted claim is inherited through
+    the wake turn and disappears when the turn returns.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-claim.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="native review", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer="interactive")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+    finally:
+        conn.close()
+
+    class ToolCallingAdapter(PushAdapter):
+        async def handle_message(self, event):
+            from gateway.kanban_claim import current_kanban_run_claim
+            from tools.kanban_tools import _resolve_expected_run_id
+
+            claim = current_kanban_run_claim()
+            assert claim is not None
+            assert claim.task_id == task_id
+            conn = kbc.connect()
+            try:
+                assert _resolve_expected_run_id(kb, conn, task_id) == run_id
+                assert kb.complete_task(
+                    conn, task_id, summary="approved", expected_run_id=run_id,
+                )
+            finally:
+                conn.close()
+            event._gateway_accepted = True
+
+    from gateway.kanban_claim import KanbanRunClaim, current_kanban_run_claim
+
+    adapter = ToolCallingAdapter()
+    asyncio.run(
+        deliver_wake(
+            adapter, text="review this", source=_source(),
+            kanban_claim=KanbanRunClaim(None, task_id, run_id),
+        )
+    )
+    assert current_kanban_run_claim() is None
 
 
 async def _serve(handler):
