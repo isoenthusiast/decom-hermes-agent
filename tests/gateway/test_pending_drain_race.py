@@ -33,6 +33,8 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
 from gateway.kanban_claim import KanbanRunClaim, current_kanban_run_claim
+from gateway.run_turn import GatewayTurnMixin
+from gateway.turn_context import TurnContext
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -265,3 +267,75 @@ async def test_native_wake_claim_survives_busy_queue_and_binds_at_consumer():
 
     assert seen == [("task-first", 101), ("task-second", 202)]
     assert current_kanban_run_claim() is None
+
+
+@pytest.mark.asyncio
+async def test_runner_followup_binds_event_claim_and_clears_prior_claim():
+    """The real runner recursion must bind the dequeued event claim at turn execution."""
+
+    class RunnerHarness(GatewayTurnMixin):
+        _MAX_INTERRUPT_DEPTH = 3
+
+        def __init__(self):
+            self.seen = []
+
+        async def _run_agent_deliver_first_response(self, *args, **kwargs):
+            return None
+
+        def _adapter_for_source(self, source):
+            return None
+
+        async def _refresh_agent_cache_message_count(self, *args):
+            return None
+
+        def _session_key_for_source(self, source):
+            return "telegram:dm:42"
+
+        async def _prepare_profile_scoped_inbound_message_text(self, *, event, **kwargs):
+            return event.text
+
+        def _reply_anchor_for_event(self, event):
+            return None
+
+        def _is_goal_continuation_event(self, event):
+            return False
+
+        def _goal_still_active_for_session(self, session_id):
+            return True
+
+        async def _run_agent(self, **kwargs):
+            claim = current_kanban_run_claim()
+            self.seen.append(None if claim is None else (claim.task_id, claim.run_id))
+            return {"messages": kwargs["history"]}
+
+    runner = RunnerHarness()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm")
+    ctx = TurnContext(
+        source=source, session_id="session", session_key="telegram:dm:42", history=[],
+    )
+    event = _make_event(text="review")
+    event._kanban_claim = KanbanRunClaim("default", "task-review", 123)
+
+    await runner._run_agent_queued_followup(
+        ctx, adapter=None, pending=event.text, pending_event=event,
+        response="done", result={"messages": []}, stream_task=None,
+    )
+    assert runner.seen == [("task-review", 123)]
+    assert current_kanban_run_claim() is None
+
+    second = _make_event(text="review-again")
+    second._kanban_claim = KanbanRunClaim("default", "task-second", 456)
+    await runner._run_agent_queued_followup(
+        ctx, adapter=None, pending=second.text, pending_event=second,
+        response="done", result={"messages": []}, stream_task=None,
+    )
+    assert runner.seen == [("task-review", 123), ("task-second", 456)]
+    assert current_kanban_run_claim() is None
+
+    from gateway.kanban_claim import kanban_run_claim
+    with kanban_run_claim(KanbanRunClaim("default", "stale", 999)):
+        await runner._run_agent_queued_followup(
+            ctx, adapter=None, pending="ordinary", pending_event=None,
+            response="done", result={"messages": []}, stream_task=None,
+        )
+    assert runner.seen == [("task-review", 123), ("task-second", 456), None]

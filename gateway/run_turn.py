@@ -3491,13 +3491,19 @@ class GatewayTurnMixin:
         # guard will consult. Fail-safe in helper.
         await self._refresh_agent_cache_message_count(session_key, session_id)
 
-        followup_result = await self._run_agent(
-            message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
-            source=next_source, session_id=session_id, session_key=next_session_key,
-            run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
-            event_message_id=next_message_id, channel_prompt=next_channel_prompt,
-            message_type=next_message_type,
-        )
+        from gateway.kanban_claim import kanban_run_claim
+        # A queued event is consumed in a later recursive runner turn, after the admission
+        # ContextVar scope has ended. Bind only that trusted event claim for this turn; an
+        # ordinary/steer follow-up explicitly binds None so a prior review claim cannot leak.
+        _followup_claim = getattr(pending_event, "_kanban_claim", None) if pending_event is not None else None
+        with kanban_run_claim(_followup_claim):
+            followup_result = await self._run_agent(
+                message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
+                source=next_source, session_id=session_id, session_key=next_session_key,
+                run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
+                event_message_id=next_message_id, channel_prompt=next_channel_prompt,
+                message_type=next_message_type,
+            )
         return _preserve_queued_followup_history_offset(result, followup_result)
 
     async def _run_agent_cleanup_turn_tasks(
