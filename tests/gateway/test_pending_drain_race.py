@@ -22,6 +22,7 @@ dropping it.
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -35,6 +36,9 @@ from gateway.session import SessionSource, build_session_key
 from gateway.kanban_claim import KanbanRunClaim, current_kanban_run_claim
 from gateway.run_turn import GatewayTurnMixin
 from gateway.turn_context import TurnContext
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from tools import kanban_tools
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -339,3 +343,138 @@ async def test_runner_followup_binds_event_claim_and_clears_prior_claim():
             response="done", result={"messages": []}, stream_task=None,
         )
     assert runner.seen == [("task-review", 123), ("task-second", 456), None]
+
+
+def _make_review_run(conn, title):
+    task_id = kb.create_task(conn, title=title, assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="builder:test")
+    assert implementation is not None
+    assert kb.request_review(
+        conn, task_id, reviewer="reviewer", summary="ready",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:test")
+    assert review is not None
+    return task_id, review.current_run_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["complete", "request_changes"])
+@pytest.mark.parametrize("claim_kind", ["valid", "stale", "foreign", "cross_board", "none"])
+async def test_real_busy_queue_runner_followup_reaches_lifecycle_handlers(
+    tmp_path, monkeypatch, action, claim_kind
+):
+    """Exercise adapter admission -> pending dequeue -> runner recursion -> real tool handler.
+
+    The temporary board makes the assertions about DB mutation, rather than merely
+    ContextVar observation.  Invalid claims must leave the live review run intact.
+    """
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    conn = kbc.connect(db_path)
+    task_id, run_id = _make_review_run(conn, f"{action}-{claim_kind}")
+    foreign_task, foreign_run_id = _make_review_run(conn, "foreign")
+    conn.close()
+
+    target_claim = {
+        "valid": KanbanRunClaim("default", task_id, run_id),
+        "stale": KanbanRunClaim("default", task_id, run_id - 1),
+        "foreign": KanbanRunClaim("default", foreign_task, foreign_run_id),
+        "cross_board": KanbanRunClaim("other-board", task_id, run_id),
+        "none": None,
+    }[claim_kind]
+    adapter = _make_adapter()
+    runner = None
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm")
+    session_key = build_session_key(source)
+    ctx = TurnContext(source=source, session_id="session", session_key=session_key, history=[])
+
+    class RealRunner(GatewayTurnMixin):
+        _MAX_INTERRUPT_DEPTH = 3
+
+        def __init__(self):
+            self.seen = []
+            self._draining = False
+
+        async def _run_agent_deliver_first_response(self, *args, **kwargs):
+            return None
+
+        def _adapter_for_source(self, source):
+            return adapter
+
+        async def _refresh_agent_cache_message_count(self, *args):
+            return None
+
+        def _session_key_for_source(self, source):
+            return session_key
+
+        async def _prepare_profile_scoped_inbound_message_text(self, *, event, **kwargs):
+            return event.text
+
+        def _reply_anchor_for_event(self, event):
+            return None
+
+        def _is_goal_continuation_event(self, event):
+            return False
+
+        def _goal_still_active_for_session(self, session_id):
+            return True
+
+        def _promote_queued_event(self, session_key, adapter, pending_event):
+            return pending_event
+
+        def _pending_event_audio_paths(self, event):
+            return []
+
+        async def _run_agent(self, **kwargs):
+            event_claim = current_kanban_run_claim()
+            self.seen.append(None if event_claim is None else (event_claim.task_id, event_claim.run_id))
+            args = {"task_id": task_id}
+            if action == "complete":
+                args["summary"] = "approved by queued runner"
+                output = kanban_tools._handle_complete(args)
+            else:
+                args["reason"] = "queued runner found a defect"
+                output = kanban_tools._handle_request_changes(args)
+            return {"messages": kwargs["history"], "tool_output": json.loads(output)}
+
+    runner = RealRunner()
+
+    async def first_handler(event):
+        first_started.set()
+        await release_first.wait()
+        pending_event, pending = await runner._run_agent_drain_pending(
+            {"messages": []}, adapter, source, ctx.session_key,
+        )
+        await runner._run_agent_queued_followup(
+            ctx, adapter, pending, pending_event, "done", {"messages": []}, None,
+        )
+        return "ok"
+
+    adapter._message_handler = first_handler
+    first = _make_event(text="first")
+    second = _make_event(text=action)
+    second._kanban_claim = target_claim
+    await adapter.handle_message(first)
+    await asyncio.wait_for(first_started.wait(), timeout=5)
+    await adapter.handle_message(second)
+    assert adapter._pending_messages[session_key] is second
+    release_first.set()
+    owner_task = adapter._session_tasks[session_key]
+    await asyncio.wait_for(asyncio.shield(owner_task), timeout=5)
+    await adapter.cancel_background_tasks()
+
+    conn = kbc.connect(db_path)
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    if claim_kind == "valid":
+        assert task.status == ("done" if action == "complete" else "ready")
+    else:
+        assert task.status == "running"
+        assert task.assignee == "reviewer"
+        assert task.current_run_id == run_id
+    conn.close()
