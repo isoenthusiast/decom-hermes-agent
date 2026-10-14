@@ -70,6 +70,7 @@ _ACTIVE_STATES = ("running", "stalling")
 # Routing origin persisted at dispatch so a restart-recovered completion can
 # reconstruct a full SessionSource (scope_id drives relay tenant egress).
 _ROUTING_KEYS = ("scope_id", "user_id", "user_name")
+_KANBAN_CLAIM_KEY = "_kanban_claim"
 # Structured stall metadata — additive, present only on stall finalizations.
 _STALL_META_KEYS = ("stalled_after_quiet_seconds", "stall_threshold_seconds", "stall_phase", "stall_grace_seconds")
 # Private stall bookkeeping on the record -> public field in list_async_delegations().
@@ -168,7 +169,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", *_ROUTING_KEYS, _KANBAN_CLAIM_KEY)
         if key in record}
     with _DB_LOCK, _transaction() as conn:
         conn.execute("""INSERT OR REPLACE INTO async_delegations
@@ -281,7 +282,7 @@ def recover_abandoned_delegations() -> int:
                 "status": "unknown", "summary": None, "error": error,
                 **({"results": recovered_results} if recovered_results else {}),
                 "dispatched_at": dispatched_at, "completed_at": now,
-                **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
+                **{k: task[k] for k in (*_ROUTING_KEYS, _KANBAN_CLAIM_KEY) if task.get(k)}}
             result = {"status": "unknown", "summary": None, "error": event["error"],
                       **({"results": recovered_results} if recovered_results else {})}
             conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
@@ -570,12 +571,15 @@ def _dispatch(
     classify = _batch_status if is_batch else (lambda r: r.get("status") or "completed")
     crash_result = _batch_crash if is_batch else _single_crash
     dispatched_at = time.time()
+    from gateway.kanban_claim import current_kanban_run_claim, kanban_run_claim_payload
+    claim_payload = kanban_run_claim_payload(current_kanban_run_claim())
     record: Dict[str, Any] = {
         "delegation_id": delegation_id, "goal": goal, **({"goals": list(goals)} if is_batch else {}),
         "context": context, "toolsets": list(toolsets) if toolsets else None, "role": role, "model": model,
         "session_key": session_key, "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id, "parent_session_id": parent_session_id,
         **_capture_routing_origin(),
+        **({_KANBAN_CLAIM_KEY: claim_payload} if claim_payload is not None else {}),
         "status": "running", "dispatched_at": dispatched_at, "completed_at": None,
         "interrupt_fn": interrupt_fn, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
         "slot_key": slot_key or delegation_id,
@@ -748,7 +752,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         "model": record.get("model") if is_batch else (result.get("model") or record.get("model")),
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
-        **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
+        **{k: record[k] for k in (*_ROUTING_KEYS, _KANBAN_CLAIM_KEY) if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
     _persist_completion(evt, result)
     try:
@@ -786,7 +790,7 @@ def push_task_failure_notice(delegation_id: str, entry: Dict[str, Any], *, n_tas
         "goal": snapshot.get("goal", ""), "goals": snapshot.get("goals"), "context": snapshot.get("context"),
         "toolsets": snapshot.get("toolsets"), "role": snapshot.get("role"), "model": snapshot.get("model"),
         "status": "running", "dispatched_at": snapshot.get("dispatched_at") or time.time(), "completed_at": time.time(),
-        **{k: snapshot[k] for k in _ROUTING_KEYS if snapshot.get(k)}}
+        **{k: snapshot[k] for k in (*_ROUTING_KEYS, _KANBAN_CLAIM_KEY) if snapshot.get(k)}}
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover

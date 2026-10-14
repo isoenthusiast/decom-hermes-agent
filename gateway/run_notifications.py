@@ -962,6 +962,9 @@ class GatewayNotificationsMixin:
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None, metadata=metadata,
             )
+            from gateway.kanban_claim import kanban_run_claim, kanban_run_claim_from_payload
+            claim = kanban_run_claim_from_payload(evt.get("_kanban_claim"))
+            synth_event._kanban_claim = claim
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name, source.chat_id, source.thread_id,
@@ -971,7 +974,8 @@ class GatewayNotificationsMixin:
             _prime = getattr(adapter, "prime_routing_cache", None)
             if callable(_prime):
                 _prime(synth_event)
-            await admit_internal_event(adapter, synth_event)
+            with kanban_run_claim(claim):
+                await admit_internal_event(adapter, synth_event)
             return True
         except WakeNotAccepted:
             # Durable callers refund the claim; ordinary watch callers just requeue.
@@ -1218,6 +1222,16 @@ class GatewayNotificationsMixin:
     def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(str(evt.get(field) or "") for field in fields)
 
+    @classmethod
+    def _async_event_group_key(cls, evt: dict) -> tuple[str, ...]:
+        """Keep different review claims and ordinary completions in separate turns."""
+        from gateway.kanban_claim import kanban_run_claim_from_payload
+        claim = kanban_run_claim_from_payload(evt.get("_kanban_claim"))
+        claim_key = ("", "", "") if claim is None else (
+            claim.board or "", claim.task_id, str(claim.run_id),
+        )
+        return (*cls._event_route_key(evt, cls._ASYNC_GROUP_KEY_FIELDS), *claim_key)
+
     @staticmethod
     def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
         """Build one bounded synthetic event from several redacted completions."""
@@ -1448,7 +1462,7 @@ class GatewayNotificationsMixin:
                 groups: dict[tuple[str, ...], list[dict]] = {}
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
-                    groups.setdefault(self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS), []).append(evt)
+                    groups.setdefault(self._async_event_group_key(evt), []).append(evt)
                 for group in groups.values():
                     try:
                         delivered = await self._deliver_async_delegation_group(group)

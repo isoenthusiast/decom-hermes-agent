@@ -23,6 +23,7 @@ dropping it.
 
 import asyncio
 import json
+import queue
 from unittest.mock import AsyncMock
 
 import pytest
@@ -33,12 +34,14 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
-from gateway.kanban_claim import KanbanRunClaim, current_kanban_run_claim
+from gateway.kanban_claim import KanbanRunClaim, current_kanban_run_claim, kanban_run_claim
+from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.run_turn import GatewayTurnMixin
 from gateway.turn_context import TurnContext
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from tools import kanban_tools
+from tools import async_delegation, kanban_tools
+from tools.process_registry import process_registry
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -468,6 +471,91 @@ async def test_real_busy_queue_runner_followup_reaches_lifecycle_handlers(
     await asyncio.wait_for(asyncio.shield(owner_task), timeout=5)
     await adapter.cancel_background_tasks()
 
+    conn = kbc.connect(db_path)
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    if claim_kind == "valid":
+        assert task.status == ("done" if action == "complete" else "ready")
+    else:
+        assert task.status == "running"
+        assert task.assignee == "reviewer"
+        assert task.current_run_id == run_id
+    conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["complete", "request_changes"])
+@pytest.mark.parametrize("claim_kind", ["valid", "stale", "foreign", "cross_board", "none"])
+async def test_async_delegation_completion_preserves_review_claim_to_lifecycle_handler(
+    tmp_path, monkeypatch, action, claim_kind
+):
+    """A detached result is a continuation of its spawning review turn, not an ordinary turn."""
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    conn = kbc.connect(db_path)
+    task_id, run_id = _make_review_run(conn, f"async-{action}-{claim_kind}")
+    foreign_task, foreign_run_id = _make_review_run(conn, "async-foreign")
+    conn.close()
+    assert run_id is not None
+    assert foreign_run_id is not None
+
+    target_claim = {
+        "valid": KanbanRunClaim("default", task_id, run_id),
+        "stale": KanbanRunClaim("default", task_id, run_id - 1),
+        "foreign": KanbanRunClaim("default", foreign_task, foreign_run_id),
+        "cross_board": KanbanRunClaim("other-board", task_id, run_id),
+        "none": None,
+    }[claim_kind]
+    completion_queue = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", completion_queue)
+    adapter = _make_adapter()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm")
+    session_key = build_session_key(source)
+    seen = []
+
+    async def handler(_event):
+        claim = current_kanban_run_claim()
+        seen.append(None if claim is None else (claim.task_id, claim.run_id))
+        args = {"task_id": task_id}
+        if action == "complete":
+            args["summary"] = "approved after detached review"
+            kanban_tools._handle_complete(args)
+        else:
+            args["reason"] = "detached review found a defect"
+            kanban_tools._handle_request_changes(args)
+        return "ok"
+
+    adapter._message_handler = handler
+
+    class NotificationHarness(GatewayNotificationsMixin):
+        def _build_process_event_source(self, evt):
+            return source
+
+        def _resolve_injection_adapter(self, platform_name, source=None):
+            return adapter
+
+    runner = NotificationHarness()
+    with kanban_run_claim(target_claim):
+        dispatched = async_delegation.dispatch_async_delegation(
+            goal="finish independent review", context=None, toolsets=None,
+            role="leaf", model="test", session_key=session_key,
+            parent_session_id="session", runner=lambda: {
+                "status": "completed", "summary": "review finished",
+            },
+        )
+    assert dispatched["status"] == "dispatched"
+    event = await asyncio.to_thread(completion_queue.get, True, 5)
+    assert await runner._inject_watch_notification("review result", event) is True
+    owner_task = adapter._session_tasks[session_key]
+    await asyncio.wait_for(asyncio.shield(owner_task), timeout=5)
+    await adapter.cancel_background_tasks()
+
+    expected_seen = None if target_claim is None else (target_claim.task_id, target_claim.run_id)
+    assert seen == [expected_seen]
+    assert current_kanban_run_claim() is None
     conn = kbc.connect(db_path)
     task = kb.get_task(conn, task_id)
     assert task is not None

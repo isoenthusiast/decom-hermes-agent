@@ -94,6 +94,26 @@ def _completion_event(*, started_at, session_id="proc_reused"):
     }
 
 
+def test_async_completion_groups_isolate_review_claims_from_each_other_and_ordinary_turns():
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    ordinary = _async_event("deleg_ordinary")
+    review_a = {
+        **_async_event("deleg_review_a"),
+        "_kanban_claim": {"board": "default", "task_id": "task-a", "run_id": 11},
+    }
+    review_b = {
+        **_async_event("deleg_review_b"),
+        "_kanban_claim": {"board": "default", "task_id": "task-b", "run_id": 22},
+    }
+
+    keys = {
+        runner._async_event_group_key(ordinary),
+        runner._async_event_group_key(review_a),
+        runner._async_event_group_key(review_b),
+    }
+    assert len(keys) == 3
+
+
 def _stop_after_sleeps(monkeypatch, runner, count):
     sleep_calls = 0
 
